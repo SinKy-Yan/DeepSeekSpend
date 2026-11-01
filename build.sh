@@ -6,7 +6,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"           # DeepSeekSpend 项目目录
-OUT="$ROOT/../DeepSeekSpend.app"                 # 生成的 App 放在「deepseek 消费」文件夹里
+OUT="$ROOT/../build/DeepSeekSpend.app"           # 生成的 App 放在工程目录的 build/ 下
 APP_NAME="DeepSeekSpend"
 BUNDLE_ID="com.deepseekspend.menu"
 TMP="$ROOT/.build"
@@ -17,8 +17,33 @@ rm -rf "$OUT" "$TMP"
 mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources" "$TMP"
 
 echo "==> 编译 Swift (arm64, macOS 13+)"
+# 某些 Command Line Tools 版本同时留下 swift/module.modulemap 与 swift/bridging.modulemap，
+# 两者都声明 SwiftBridging 会让 clang 报「redefinition of module」。用 VFS 覆盖掉旧文件。
+SWIFT_VFS=()
+if [ -f /Library/Developer/CommandLineTools/usr/include/swift/module.modulemap ] \
+   && [ -f /Library/Developer/CommandLineTools/usr/include/swift/bridging.modulemap ]; then
+  echo "    检测到 CLT modulemap 冲突，启用 VFS 覆盖"
+  printf '// disabled: SwiftBridging is defined by bridging.modulemap\n' > "$TMP/empty.modulemap"
+  cat > "$TMP/clt-overlay.yaml" <<YAML
+{
+  "version": 0,
+  "fallthrough": true,
+  "roots": [
+    {
+      "type": "directory",
+      "name": "/Library/Developer/CommandLineTools/usr/include/swift",
+      "contents": [
+        { "type": "file", "name": "module.modulemap", "external-contents": "$TMP/empty.modulemap" }
+      ]
+    }
+  ]
+}
+YAML
+  SWIFT_VFS=(-vfsoverlay "$TMP/clt-overlay.yaml")
+fi
 swiftc -O \
   -target arm64-apple-macosx13.0 \
+  "${SWIFT_VFS[@]}" \
   "$ROOT/App/main.swift" \
   -o "$OUT/Contents/MacOS/$APP_NAME" \
   -framework AppKit -framework SwiftUI -framework ServiceManagement
@@ -26,35 +51,36 @@ swiftc -O \
 echo "==> 复制采集器与配置"
 cp "$ROOT/collector.mjs" "$OUT/Contents/Resources/collector.mjs"
 cp "$ROOT/config.json"   "$OUT/Contents/Resources/config.json"
-cp "$ROOT/assets/demo-snapshot.json" "$OUT/Contents/Resources/demo-snapshot.json"
+
 
 echo "==> 查找并内置兼容的 Node.js"
+# 需要一个自带 zstd 解压能力、且不依赖 Homebrew 动态库的自包含 node。
 NODE_BIN="${DEEPSEEKSPEND_NODE:-}"
-if [ -z "$NODE_BIN" ]; then NODE_BIN="$(command -v node || true)"; fi
 if [ -z "$NODE_BIN" ] || ! "$NODE_BIN" -e "require('node:zlib').zstdDecompressSync" 2>/dev/null; then
-  for CANDIDATE in "$HOME"/.trae-cn/binaries/node/versions/*/bin/node "$HOME/Documents/DeepSeek-Harness/.runtime/node/bin/node"; do
-    if [ -x "$CANDIDATE" ] && "$CANDIDATE" -e "require('node:zlib').zstdDecompressSync" 2>/dev/null; then
+  for CANDIDATE in "$ROOT/tools/node-runtime" "/Applications/DeepSeekSpend.app/Contents/Resources/node" "$(command -v node || true)"; do
+    if [ -n "$CANDIDATE" ] && [ -x "$CANDIDATE" ] && "$CANDIDATE" -e "require('node:zlib').zstdDecompressSync" 2>/dev/null; then
       NODE_BIN="$CANDIDATE"
       break
     fi
   done
 fi
 if [ -z "$NODE_BIN" ] || ! "$NODE_BIN" -e "require('node:zlib').zstdDecompressSync" 2>/dev/null; then
-  echo "错误：未找到支持 zstdDecompressSync 的 Node.js（需要 v22.15+）" >&2
+  echo "错误：未找到自包含且支持 zstdDecompressSync 的 Node.js（需要 v22.15+）" >&2
+  echo "      可设置 DEEPSEEKSPEND_NODE=/path/to/node 后重试" >&2
   exit 1
 fi
 NODE_REAL="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$NODE_BIN")"
 NODE_ROOT="$(dirname "$(dirname "$NODE_REAL")")"
-if [ ! -f "$NODE_ROOT/LICENSE" ]; then
-  echo "错误：找不到 Node.js LICENSE：$NODE_ROOT/LICENSE" >&2
-  exit 1
-fi
 cp "$NODE_REAL" "$OUT/Contents/Resources/node"
 chmod +x "$OUT/Contents/Resources/node"
-cp "$NODE_ROOT/LICENSE" "$OUT/Contents/Resources/Node-LICENSE"
+if [ -f "$NODE_ROOT/LICENSE" ]; then
+  cp "$NODE_ROOT/LICENSE" "$OUT/Contents/Resources/Node-LICENSE"
+elif [ -f "$ROOT/tools/Node-LICENSE" ]; then
+  cp "$ROOT/tools/Node-LICENSE" "$OUT/Contents/Resources/Node-LICENSE"
+fi
 
 echo "==> 生成图标"
-swift "$ROOT/genicon.swift" "$TMP/icon_1024.png"
+swift "${SWIFT_VFS[@]}" "$ROOT/genicon.swift" "$TMP/icon_1024.png"
 ICONSET="$TMP/AppIcon.iconset"
 mkdir -p "$ICONSET"
 for s in 16 32 128 256 512; do
@@ -81,7 +107,7 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.1.0</string>
+	<string>1.2.1</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>
@@ -111,7 +137,7 @@ du -sh "$OUT"
 if [ "$MODE" = "release" ]; then
   DIST="$ROOT/dist"
   mkdir -p "$DIST"
-  VERSION="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$OUT/Contents/Info.plist" 2>/dev/null || echo 1.1.0)"
+  VERSION="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$OUT/Contents/Info.plist" 2>/dev/null || echo 1.2.1)"
   ARCH="arm64"
   ZIP="$DIST/DeepSeekSpend-v${VERSION}-macOS-${ARCH}.zip"
   rm -f "$ZIP"

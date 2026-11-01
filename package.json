@@ -1,6 +1,6 @@
 {
   "name": "deepseek-spend",
-  "version": "1.1.0",
+  "version": "1.2.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,5 +8,6 @@
   },
   "engines": {
     "node": ">=22.15"
-  }
+  },
+  "description": "macOS 菜单栏余额 / 花费面板：只显示还剩多少钱和本小时花了多少"
 }

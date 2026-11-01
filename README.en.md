@@ -5,111 +5,88 @@
 # DeepSeekSpend
 
 <p align="center">
-  <img src="assets/product-overview-en.png" alt="DeepSeekSpend product overview" width="100%">
+  <img src="assets/panel-dark.png" alt="DeepSeekSpend panel" width="320">
 </p>
 
 <p align="center">
-  A local macOS menu-bar panel for estimated DeepSeek Harness cost by natural hour, project, and task.
+  A tiny macOS menu bar widget that answers two questions: <b>how much is left</b>, and <b>how much am I burning this hour</b>.
 </p>
 
 <p align="center">
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-16A34A?style=flat-square"></a>
   <img alt="macOS 13+" src="https://img.shields.io/badge/macOS-13%2B-1E3A8A?style=flat-square&logo=apple&logoColor=white">
   <img alt="Apple silicon" src="https://img.shields.io/badge/Apple%20silicon-arm64-2563EB?style=flat-square">
-  <a href="https://github.com/yinshi1226-ai/DeepSeekSpend/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/yinshi1226-ai/DeepSeekSpend/ci.yml?label=CI&style=flat-square"></a>
-  <a href="https://github.com/yinshi1226-ai/DeepSeekSpend/releases"><img alt="Release" src="https://img.shields.io/github/v/release/yinshi1226-ai/DeepSeekSpend?label=release&style=flat-square"></a>
 </p>
 
 > [!IMPORTANT]
-> Values are calculated from local token records and the bundled price table. They are usage estimates, not an official DeepSeek bill. Use the official platform for balance, recharge, and final charges.
+> The spend figure is an estimate computed from local token logs and a price table — not a DeepSeek invoice. The balance comes from the official API.
 
 ## What it shows
 
-- Current natural-hour estimate in the menu bar: `● ¥X.XX`.
-- Current hour, today, and lifetime totals in one panel.
-- A clickable 24-hour usage chart.
-- Per-project live and lifetime estimates, expandable to tasks, models, and token composition.
-- Child-agent usage merged into its parent task; empty sessions are filtered out.
-- A separate WorkBuddy DeepSeek summary with estimated cost and call count.
-- Optional DeepSeek account balance with a direct link to the official platform.
+| Dark | Light |
+|---|---|
+| <img src="assets/panel-dark.png" width="280"> | <img src="assets/panel-light.png" width="280"> |
 
-## Interface
+- Status bar always shows the remaining balance (`¥37.02`).
+- Large number: balance. Small line: spend for the current clock hour.
+- Below: today's spend and lifetime spend.
+- Footer: refresh, launch at login, quit. No project tree, no per-session breakdown, no charts.
 
-<p align="center">
-  <img src="assets/app-demo.png" alt="DeepSeekSpend anonymous demo" width="520">
-</p>
+> Screenshots use demo numbers, captured with `--appearance` to force each theme.
 
-The screenshot is generated with the built-in `--demo` mode. Project names, costs, balance, and call counts are demonstration data.
-
-## Pricing formula
+## How the estimate works
 
 ```text
-estimate = uncached input tokens × input price
-         + cached input tokens × cache-hit price
-         + output tokens × output price
+cost = uncached input tokens × input price
+     + cache-hit input tokens × cache price
+     + output tokens × output price
 ```
 
-The bundled CNY table follows the official prices for `deepseek-v4-pro` and `deepseek-v4-flash` on the [DeepSeek pricing page](https://api-docs.deepseek.com/quick_start/pricing/). Unknown models are not silently priced as another model: they contribute 0 and produce a snapshot warning.
+- Prices follow the [official pricing page](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/), split into peak (weekdays 09:00–12:00 and 14:00–18:00 Beijing time) and idle (half price).
+- Locally deployed models listed in `freeModels` are billed at ¥0 (e.g. `GLM-5.3-Flash`) and never raise a "missing price" warning.
+- Branched / sub-agent sessions copy the parent's history into their own log, so calls are de-duplicated by a `time + model + tokens` fingerprint.
+- Unknown models are priced at ¥0 with a visible note instead of silently borrowing another model's rate.
 
-## Install
-
-### Download a release
-
-1. Open the [latest release](https://github.com/yinshi1226-ai/DeepSeekSpend/releases/latest) and download `DeepSeekSpend-v*-macOS-arm64.zip`.
-2. Unzip and move `DeepSeekSpend.app` to Applications or another fixed location.
-3. On first launch, right-click the app and choose **Open** to confirm the locally signed build.
-4. Optionally enable launch at login in the footer.
-
-The release bundles a compatible Node.js runtime. Users do not need to install Node separately. Current builds support Apple silicon and macOS 13 or later.
-
-### Build from source
+## Build from source
 
 ```bash
-git clone https://github.com/yinshi1226-ai/DeepSeekSpend.git
+git clone <your-repo-url> DeepSeekSpend
 cd DeepSeekSpend
 npm test
-./build.sh release
-open ../DeepSeekSpend.app
+./build.sh        # -> ../build/DeepSeekSpend.app
+open ../build/DeepSeekSpend.app
 ```
 
-Source builds require the Swift toolchain and Node.js 22.15 or later.
+Requires Apple silicon, macOS 13+, the Swift toolchain and a Node.js 22.15+ binary that supports zstd. The bundled runtime is looked up at `tools/node-runtime`, then `/Applications/DeepSeekSpend.app/Contents/Resources/node`, then `node` on `PATH`; override with `DEEPSEEKSPEND_NODE=/path/to/node`. Homebrew's `node` is a thin binary linked against `libnode.dylib` and is skipped automatically.
 
-## Data and privacy
+## Data & privacy
 
-| Data | Local source or network boundary |
+| Data | Source |
 |---|---|
-| Harness tasks and tokens | `~/Documents/DeepSeek-Harness/data/sessions/**/session.jsonl.zstd` and the local Harness API |
-| Project running state | `http://127.0.0.1:3080/api/session.list` |
-| WorkBuddy usage | `~/.workbuddy/traces/**/*.json` |
-| Account balance (optional) | API key is used only for DeepSeek's official `https://api.deepseek.com/user/balance` endpoint |
+| Calls and tokens | `~/.dsh/sessions/**/session.v4.jsonl.zstd` |
+| API key | `DEEPSEEK_API_KEY` in `~/.dsh/.credentials.yaml` |
+| Balance | `https://api.deepseek.com/user/balance` |
 
-- Task parsing and cost estimation happen locally.
-- Project names and task details are not sent to third-party services.
-- The app contains no telemetry or advertising SDK.
-- Balance lookup sends the Harness-configured API key only to DeepSeek's official endpoint; local statistics still work without it.
-- The app is ad-hoc signed and does not create or install a self-signed root certificate.
-
-See [SECURITY.md](SECURITY.md) for boundaries and vulnerability reporting.
+Chat content is never read or uploaded — only token counts. The single network call is the balance lookup, sent to DeepSeek's official endpoint. No telemetry, no ads. The app is ad-hoc signed; building never touches certificates, the keychain, or trust settings.
 
 ## Configuration
 
-Runtime configuration is stored at `~/Library/Application Support/DeepSeekSpend/config.json`:
+`~/Library/Application Support/DeepSeekSpend/config.json`:
 
-- `prices`: CNY per million tokens;
-- `apiBase`: local DeepSeek Harness address;
-- `pollIntervalMs` / `balanceIntervalMs`: collection intervals;
-- `workbuddyTracesDir`: WorkBuddy trace directory.
+| Key | Meaning |
+|---|---|
+| `dshDataDir` | DSH data directory, defaults to `~/.dsh` |
+| `prices.peakIdle` / `prices.flat` | CNY per million tokens |
+| `freeModels` | Models to bill at ¥0 (wildcards like `glm-*` supported) |
+| `pollIntervalMs` / `balanceIntervalMs` | Polling (8s) and balance refresh (5min) |
+| `platformUrl` | Opened by the "账单 / Usage" link |
 
-Upgrades keep local paths and polling settings while refreshing the verified bundled price table.
+## Relation to upstream
 
-## Development
+A local fork of [yinshi1226-ai/DeepSeekSpend](https://github.com/yinshi1226-ai/DeepSeekSpend), keeping the upstream MIT license and copyright.
 
-```bash
-npm test
-./build.sh
-./build.sh release
-```
+Changes: UI reduced to balance + spend; collector reads logs only (no local Harness API) and adds cross-session de-duplication plus free local models; pricing switched to official peak/idle tiers; build script adapted to the v4 log naming, the CLT `SwiftBridging` modulemap conflict and a self-contained Node runtime.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) © upstream authors and contributors of this repository

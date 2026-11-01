@@ -1,83 +1,41 @@
-// DeepSeekSpend — macOS 菜单栏实时消费显示器
+// DeepSeekSpend Lite — macOS 菜单栏余额显示器
 // 编译: swiftc -O -target arm64-apple-macosx13.0 main.swift -o DeepSeekSpend \
 //        -framework AppKit -framework SwiftUI -framework ServiceManagement
+//
+// 设计意图：只回答两个问题 —— 我还剩多少钱（余额，大字）、我这一小时花了多少（小字）。
+// 不再有项目 / 会话 / WorkBuddy 分栏，整个界面只有「余额 + 花费」。
 
 import AppKit
 import SwiftUI
 import ServiceManagement
 
-// MARK: - 快照数据模型（与 collector.mjs 输出的 snapshot.json 对应）
+// MARK: - 快照模型（与 collector.mjs 输出的 snapshot.json 对应）
 
 struct Snapshot: Decodable {
     var generatedAt: Double
     var hourStart: Double
     var overall: Overall
-    var hourly: [HourBucket]
-    var tasks: [MergedTask]
-    var projects: [ProjectRow]
     var balance: Balance?
     var balanceError: String?
-    var workbuddy: WorkBuddyOverview?
-    var workbuddyError: String?
-    var errors: [String]
+    var errors: [String]?
 
     struct Overall: Decodable {
         var hour: Double
         var today: Double
         var total: Double
     }
-    struct HourBucket: Decodable {
-        var start: Double
-        var cost: Double
-    }
-    struct Tokens: Decodable {
-        var input: Int
-        var output: Int
-        var cacheRead: Int
-    }
-    /// 按顶层会话归并后的任务（含其派生的全部子代理）
-    struct MergedTask: Decodable {
-        var key: String
-        var name: String
-        var project: String?
-        var cwd: String?
-        var running: Bool
-        var hour: Double
-        var today: Double
-        var total: Double
-        var sessionCount: Int
-        var subCount: Int?
-        var model: String?
-        var tokens: Tokens
-        var lastEventAt: Double?
-    }
-    struct ProjectRow: Decodable {
-        var cwd: String?
-        var name: String
-        var hour: Double
-        var today: Double
-        var total: Double
-        var running: Bool
-        var sessionCount: Int
-        var lastEventAt: Double?
-        var tasks: [MergedTask]
 
-        var id: String { cwd ?? name }
-    }
     struct Balance: Decodable {
-        var currency: String
+        var currency: String?
         var totalBalance: String?
         var grantedBalance: String?
         var toppedUpBalance: String?
         var fetchedAt: Double?
     }
-    /// WorkBuddy 绑定的 DeepSeek 消费总览（单位：元）
-    struct WorkBuddyOverview: Decodable {
-        var hour: Double
-        var today: Double
-        var total: Double
-        var lastEventAt: Double?
-        var calls: Int?
+
+    var balanceValue: Double? {
+        guard let raw = balance?.totalBalance else { return nil }
+        return Double(raw)
     }
 }
 
@@ -86,16 +44,15 @@ struct Snapshot: Decodable {
 final class SpendingModel: ObservableObject {
     @Published var snapshot: Snapshot?
     @Published var loadError: String?
-    @Published var collectorRunning = false
     @Published var launchAtLogin = false
 
     var statusItem: NSStatusItem?
+    var quitting = false
+
     private var timer: Timer?
     private var collector: Process?
     private let posix = Locale(identifier: "en_US_POSIX")
-    var quitting = false
 
-    // 路径
     let supportDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/DeepSeekSpend")
     var configPath: URL { supportDir.appendingPathComponent("config.json") }
@@ -103,15 +60,24 @@ final class SpendingModel: ObservableObject {
     var triggerPath: URL { supportDir.appendingPathComponent("refresh.trigger") }
 
     var config: [String: Any] = [:]
-    var hasRunning: Bool { snapshot?.tasks.contains(where: { $0.running }) ?? false }
-    var hasError: Bool { snapshot?.errors.isEmpty == false || snapshot?.balanceError != nil }
+
+    /// 余额（元）；查不到时为 nil
+    var balance: Double? { snapshot?.balanceValue }
+
+    /// 界面底部需要提示的问题（余额取不到优先）
+    var warning: String? {
+        if let err = loadError { return err }
+        if let err = snapshot?.balanceError { return err }
+        return nil
+    }
+
+    /// 未定价模型的提示（不打断主信息，只在脚注里一句）
+    var unpricedNote: String? {
+        let list = (snapshot?.errors ?? []).filter { $0.contains("单价") }
+        return list.isEmpty ? nil : "部分模型未配置单价，估算偏低"
+    }
 
     func start() {
-        if CommandLine.arguments.contains("--demo") {
-            loadDemoSnapshot()
-            refreshLaunchAtLoginStatus()
-            return
-        }
         prepareSupportFiles()
         loadConfig()
         refreshLaunchAtLoginStatus()
@@ -123,28 +89,8 @@ final class SpendingModel: ObservableObject {
         readSnapshot()
     }
 
-    private func loadDemoSnapshot() {
-        guard let url = Bundle.main.url(forResource: "demo-snapshot", withExtension: "json"),
-              let data = try? Data(contentsOf: url),
-              var snap = try? JSONDecoder().decode(Snapshot.self, from: data) else {
-            loadError = "匿名演示数据缺失"
-            return
-        }
-        let hour = Date().timeIntervalSince1970 * 1000
-        let hourStart = floor(hour / 3_600_000) * 3_600_000
-        snap.generatedAt = hour
-        snap.hourStart = hourStart
-        for index in snap.hourly.indices {
-            snap.hourly[index].start += hourStart
-        }
-        snapshot = snap
-        loadError = nil
-        updateStatusTitle()
-    }
-
-    /// 首次运行时把打包进 Resources 的 collector 和 config 复制到 Application Support。
-    /// collector 始终跟随 App 内版本；配置保留用户的路径和轮询设置，
-    /// 但价格表跟随已核对的应用版本，避免旧版错误单价继续生效。
+    /// 首次运行把包内的 collector / config 复制到 Application Support。
+    /// 采集器始终跟随 App 内版本；配置保留用户的路径与轮询设置，价目表跟随 App 版本。
     func prepareSupportFiles() {
         try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
         guard let resources = Bundle.main.resourceURL else { return }
@@ -167,8 +113,7 @@ final class SpendingModel: ObservableObject {
             current["prices"] = bundled["prices"]
             current["pricingSource"] = bundled["pricingSource"]
             current["pricingVerifiedAt"] = bundled["pricingVerifiedAt"]
-            current.removeValue(forKey: "peakEpochIso")
-            current.removeValue(forKey: "peakHoursBeijing")
+            if let free = bundled["freeModels"] { current["freeModels"] = free }
             if let merged = try? JSONSerialization.data(withJSONObject: current, options: [.prettyPrinted, .sortedKeys]) {
                 try? merged.write(to: configPath, options: .atomic)
             }
@@ -182,47 +127,19 @@ final class SpendingModel: ObservableObject {
             return
         }
         config = obj
-        loadError = nil
     }
 
     func resolveNode() -> String? {
-        // 1. Release 内置运行时，避免依赖用户机器上的 Node 路径与版本。
         if let bundled = Bundle.main.resourceURL?.appendingPathComponent("node").path,
            nodeSupportsZstd(bundled) {
             return bundled
         }
-        // 2. 兼容旧版配置中的 node 路径。
-        if let baked = config["nodePath"] as? String, !baked.isEmpty,
-           nodeSupportsZstd(baked) {
-            return baked
-        }
-        // 3. 常见安装位置 + DSH 自带运行时。
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let dshRuntimeNode = home
-            .appendingPathComponent("Documents/DeepSeek-Harness/.runtime/node/bin/node").path
         let candidates = [
-            dshRuntimeNode,
             "/opt/homebrew/bin/node",
             "/usr/local/bin/node",
             "/usr/bin/node",
         ]
-        for c in candidates where nodeSupportsZstd(c) {
-            return c
-        }
-        // 4. 兜底：走 shell 的 PATH。
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-lc", "command -v node"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = Pipe()
-        do {
-            try p.run()
-            p.waitUntilExit()
-            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if let out, p.terminationStatus == 0, nodeSupportsZstd(out) { return out }
-        } catch {}
+        for c in candidates where nodeSupportsZstd(c) { return c }
         return nil
     }
 
@@ -262,10 +179,8 @@ final class SpendingModel: ObservableObject {
         p.standardOutput = Pipe()
         p.standardError = Pipe()
         p.terminationHandler = { [weak self] proc in
-            // 采集器意外退出时自动重启（App 退出除外）
             DispatchQueue.main.async {
                 guard let self, !self.quitting else { return }
-                self.collectorRunning = false
                 if proc.terminationStatus != 0 && self.collector === proc {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.startCollector() }
                 }
@@ -274,7 +189,6 @@ final class SpendingModel: ObservableObject {
         do {
             try p.run()
             collector = p
-            collectorRunning = true
             loadError = nil
         } catch {
             loadError = "启动采集器失败: \(error.localizedDescription)"
@@ -294,34 +208,26 @@ final class SpendingModel: ObservableObject {
         }
     }
 
+    /// 状态栏只显示余额，数字等宽，避免跳动
     func updateStatusTitle() {
         guard let button = statusItem?.button else { return }
-        let cost = snapshot?.overall.hour ?? 0
-        let text = money(cost)
-        // 纯文本标题避免 macOS 沿用旧状态栏图标的隐藏布局。
-        let plain = "● \(text)"
-        button.title = plain
-        button.toolTip = "DeepSeek 消费｜本自然小时 \(text)（\(hasError ? "异常" : (hasRunning ? "任务运行中" : "空闲"))）"
+        let hour = money(snapshot?.overall.hour ?? 0)
+        let text = balance.map(money) ?? "¥—"
+        button.attributedTitle = NSAttributedString(
+            string: text,
+            attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)]
+        )
+        button.toolTip = "DeepSeek 余额 \(text) ｜ 本小时 \(hour)"
     }
 
     func forceRefresh() {
         try? "refresh".write(to: triggerPath, atomically: true, encoding: .utf8)
-        // 顺手立刻再读一次
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.readSnapshot() }
     }
 
-    func openHarness() {
-        let base = config["apiBase"] as? String ?? "http://127.0.0.1:3080"
-        NSWorkspace.shared.open(URL(string: base)!)
-    }
-
-    func openDeepSeekPlatform() {
-        NSWorkspace.shared.open(URL(string: "https://platform.deepseek.com/usage")!)
-    }
-
-    func openProject(_ path: String?) {
-        guard let path else { return }
-        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+    func openPlatform() {
+        let url = config["platformUrl"] as? String ?? "https://platform.deepseek.com/usage"
+        if let u = URL(string: url) { NSWorkspace.shared.open(u) }
     }
 
     func toggleLaunchAtLogin() {
@@ -348,10 +254,8 @@ final class SpendingModel: ObservableObject {
         return String(format: "¥%.2f", locale: posix, v)
     }
 
-    func compactTokens(_ n: Int) -> String {
-        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
-        if n >= 1_000 { return String(format: "%.1fK", Double(n) / 1_000) }
-        return "\(n)"
+    func plainMoney(_ v: Double) -> String {
+        String(format: "%.2f", locale: posix, v)
     }
 }
 
@@ -359,461 +263,154 @@ final class SpendingModel: ObservableObject {
 
 struct MenuView: View {
     @ObservedObject var model: SpendingModel
-    private let width: CGFloat = 348
-    private let colW: CGFloat = 76
-    private let chevW: CGFloat = 12
-    private let folderW: CGFloat = 14
-    @State private var expandedProjects: Set<String> = []
-
-    // 项目列表排序（Excel 式：点表头切换列，再点切换方向）
-    enum SortColumn { case hour, total }
-    @State private var sortColumn: SortColumn = .total
-    @State private var sortAscending = false
+    private let width: CGFloat = 300
+    /// 次级文字：系统 .secondary 在浅色模式只有 ~3.9:1，这里提到 0.66 保证 AA
+    private let dim = Color.primary.opacity(0.66)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
-            Divider().padding(.vertical, 8)
-            if let snap = model.snapshot {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
-                        bigNumber(snap)
-                        chart(snap)
-                        combinedList(snap)
-                        workbuddySection(snap)
-                        if let err = model.loadError {
-                            Text(err).font(.caption2).foregroundStyle(.orange)
-                        }
-                    }
-                    .padding(.bottom, 8)
-                }
-            } else {
-                Text(model.loadError ?? "等待第一份数据…")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .padding(.vertical, 60)
-                    .frame(maxWidth: .infinity)
+            balanceBlock.padding(.top, 10)
+            Divider().padding(.vertical, 12)
+            spendRow
+            if let note = model.warning ?? model.unpricedNote {
+                warningLine(note).padding(.top, 10)
             }
-            Divider().padding(.vertical, 8)
+            Divider().padding(.vertical, 12)
             footer
         }
-        .padding(14)
-        .frame(width: width)
+        .padding(16)
+        .frame(width: width, alignment: .leading)
         .background(Color(nsColor: .windowBackgroundColor))
-        .onChange(of: model.snapshot?.generatedAt) { _ in
-            // 有任务在跑的项目自动展开，其余保持收起（列表更短）
-            guard let snap = model.snapshot else { return }
-            for p in snap.projects where p.running {
-                expandedProjects.insert(p.id)
-            }
-        }
     }
 
-    // MARK: 头部
+    // MARK: 顶部：标题 + 账单入口
 
     private var header: some View {
-        HStack(alignment: .center) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("DeepSeek Harness")
-                    .font(.system(size: 15, weight: .semibold))
-                Text(hourRangeText())
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            if let bal = balanceText() {
-                Button(action: { model.openDeepSeekPlatform() }) {
-                    Text(bal)
-                        .font(.system(size: 11, weight: .medium).monospacedDigit())
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .quaternaryLabelColor)))
-                        .contentShape(Rectangle())
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text("DeepSeek 余额")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(dim)
+            Spacer(minLength: 8)
+            Button(action: { model.openPlatform() }) {
+                HStack(spacing: 2) {
+                    Text("账单")
+                    Image(systemName: "arrow.up.right")
+                        .font(.system(size: 9, weight: .semibold))
                 }
-                .buttonStyle(.plain)
-                .help("点击跳转 DeepSeek 平台（查看用量 / 充值）")
+                .font(.system(size: 11))
+                .foregroundStyle(dim)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("在浏览器打开 DeepSeek 平台用量页")
+        }
+    }
+
+    // MARK: 余额（大字）
+
+    private var balanceBlock: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 1) {
+                Text("¥")
+                    .font(.system(size: 22, weight: .semibold, design: .rounded))
+                    .foregroundStyle(dim)
+                Text(balanceText)
+                    .font(.system(size: 44, weight: .semibold, design: .rounded).monospacedDigit())
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(model.balance.map { "余额，人民币 \(model.plainMoney($0)) 元" } ?? "余额不可用")
+            .help(balanceHelp)
+
+            // 小字：本小时消耗
+            HStack(spacing: 5) {
+                Text("本小时")
+                    .font(.system(size: 11))
+                    .foregroundStyle(dim)
+                Text(model.money(model.snapshot?.overall.hour ?? 0))
+                    .font(.system(size: 12, weight: .medium).monospacedDigit())
+                    .foregroundStyle(dim)
             }
         }
     }
 
-    private func hourRangeText() -> String {
-        guard let snap = model.snapshot else { return "自然小时窗口" }
+    private var balanceText: String {
+        guard let value = model.balance else { return "——" }
+        return model.plainMoney(value)
+    }
+
+    private var balanceHelp: String {
+        guard let ts = model.snapshot?.balance?.fetchedAt else { return "余额来自 DeepSeek 官方接口" }
         let f = DateFormatter()
-        f.dateFormat = "HH:mm"
-        let start = Date(timeIntervalSince1970: snap.hourStart / 1000)
-        let end = start.addingTimeInterval(3600)
-        return "本自然小时 \(f.string(from: start)) – \(f.string(from: end))"
+        f.dateFormat = "HH:mm:ss"
+        return "余额更新于 \(f.string(from: Date(timeIntervalSince1970: ts / 1000)))"
     }
 
-    private func balanceText() -> String? {
-        guard let bal = model.snapshot?.balance, let total = Double(bal.totalBalance ?? "") else { return nil }
-        return "余额 \(model.money(total))"
-    }
+    // MARK: 花费：今日 / 累计
 
-    // MARK: 大数字
-
-    private func bigNumber(_ snap: Snapshot) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(model.money(snap.overall.hour))
-                .font(.system(size: 34, weight: .bold, design: .rounded).monospacedDigit())
-                .foregroundStyle(Color.accentColor)
-            Text("全部任务本小时消费")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            HStack(spacing: 18) {
-                statCell(label: "今日", value: snap.overall.today)
-                statCell(label: "累计", value: snap.overall.total)
-            }
+    private var spendRow: some View {
+        HStack(alignment: .top, spacing: 24) {
+            statCell(label: "今日花费", value: model.snapshot?.overall.today ?? 0)
+            statCell(label: "累计花费", value: model.snapshot?.overall.total ?? 0)
+            Spacer(minLength: 0)
         }
     }
 
     private func statCell(label: String, value: Double) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(label).font(.caption2).foregroundStyle(.secondary)
-            Text(model.money(value)).font(.callout.weight(.semibold).monospacedDigit())
-        }
-    }
-
-    // MARK: 近 24 小时柱状图（点击柱子显示该小时的消费金额）
-
-    @State private var selectedSlot: Double?
-
-    private func chart(_ snap: Snapshot) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text("近 24 个自然小时").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                if let slot = selectedSlot,
-                   let cost = snap.hourly.first(where: { $0.start == slot })?.cost {
-                    Text("\(slotLabel(slot)) 消费 \(model.money(cost))")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(Color.accentColor)
-                } else if let maxCost = snap.hourly.map(\.cost).max(), maxCost > 0 {
-                    Text("点击柱子查看金额").font(.caption2).foregroundStyle(.tertiary)
-                }
-            }
-            HStack(alignment: .bottom, spacing: 2) {
-                ForEach(0..<24, id: \.self) { i in
-                    barColumn(i, snap: snap)
-                }
-            }
-            .frame(height: 44)
-        }
-    }
-
-    private func barColumn(_ i: Int, snap: Snapshot) -> some View {
-        let currentStart = snap.hourStart
-        let slotStart = currentStart - Double(23 - i) * 3600 * 1000
-        let cost = snap.hourly.first(where: { $0.start == slotStart })?.cost ?? 0
-        let maxCost = max(snap.hourly.map(\.cost).max() ?? 0, 0.0001)
-        let ratio = cost > 0 ? max(CGFloat(cost / maxCost), 0.06) : 0.015
-        let isSelected = selectedSlot == slotStart
-        return Button(action: {
-            selectedSlot = isSelected ? nil : slotStart
-        }) {
-            VStack(spacing: 0) {
-                Spacer(minLength: 0)
-                RoundedRectangle(cornerRadius: 1.5)
-                    .fill(isSelected ? Color.accentColor
-                          : (i == 23 ? Color.accentColor.opacity(0.75) : Color(nsColor: .separatorColor)))
-                    .frame(height: 44 * ratio)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help("\(slotLabel(slotStart))：\(model.money(cost))（点击可固定显示）")
-    }
-
-    private func slotLabel(_ start: Double) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "HH:00"
-        let d = Date(timeIntervalSince1970: start / 1000)
-        let end = d.addingTimeInterval(3600)
-        return "\(f.string(from: d))–\(f.string(from: end))"
-    }
-
-    // MARK: 合并列表：项目行同时显示「实时 + 累计」，点击展开任务明细，点表头排序
-
-    private func combinedList(_ snap: Snapshot) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            // 列头（与下方行右对齐的列宽保持一致；实时/累计可点击排序）
-            HStack(spacing: 0) {
-                Color.clear.frame(width: chevW + 6)
-                Text("项目")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 8)
-                sortHeaderButton(label: "实时", col: .hour)
-                sortHeaderButton(label: "累计", col: .total)
-                Color.clear.frame(width: folderW + 6)
-            }
-            Divider().padding(.vertical, 2)
-            // DeepSeek 消费合计行：固定在顶部，与项目行并列，不展开、不参与排序
-            deepseekTotalRow(snap)
-            Divider().padding(.vertical, 3)
-            if snap.projects.isEmpty {
-                Text("暂无项目数据").font(.caption).foregroundStyle(.tertiary)
-            } else {
-                ForEach(sortedProjects(snap.projects), id: \.id) { proj in
-                    VStack(alignment: .leading, spacing: 2) {
-                        projectRowView(proj)
-                        if expandedProjects.contains(proj.id) {
-                            ForEach(sortedTasks(proj.tasks), id: \.key) { task in
-                                taskRowView(task)
-                            }
-                            .padding(.leading, chevW + 10)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // MARK: 排序
-
-    /// DeepSeek 消费合计行：全部项目汇总，与项目行并列（同一列宽对齐），不列细分任务
-    private func deepseekTotalRow(_ snap: Snapshot) -> some View {
-        HStack(spacing: 0) {
-            Color.clear.frame(width: chevW + 6)
-            HStack(spacing: 6) {
-                Image(systemName: "yensign.circle.fill")
-                    .font(.system(size: 13))
-                    .foregroundStyle(Color.accentColor)
-                Text("DeepSeek 消费")
-                    .font(.callout.weight(.semibold))
-                    .lineLimit(1)
-                    .foregroundStyle(.primary)
-            }
-            Spacer(minLength: 8)
-            Text(model.money(snap.overall.hour))
-                .font(.callout.weight(.semibold).monospacedDigit())
-                .foregroundStyle(Color.accentColor)
-                .frame(width: colW, alignment: .trailing)
-            Text(model.money(snap.overall.total))
-                .font(.callout.weight(.bold).monospacedDigit())
-                .foregroundStyle(Color.accentColor)
-                .frame(width: colW, alignment: .trailing)
-            Color.clear.frame(width: folderW + 6)
-        }
-        .padding(.vertical, 5)
-        .contentShape(Rectangle())
-        .help("全部项目合计：实时 = 本自然小时所有任务的消费，累计 = 历史总消费")
-    }
-
-    private func toggleSort(_ col: SortColumn) {
-        if sortColumn == col {
-            sortAscending.toggle()
-        } else {
-            sortColumn = col
-            sortAscending = false // 换列后默认从大到小
-        }
-    }
-
-    private func sortHeaderButton(label: String, col: SortColumn) -> some View {
-        let active = sortColumn == col
-        let upActive = active && sortAscending
-        let downActive = active && !sortAscending
-        return Button(action: { toggleSort(col) }) {
-            HStack(spacing: 3) {
-                VStack(spacing: -3) {
-                    Image(systemName: "chevron.up")
-                        .font(.system(size: 6, weight: .bold))
-                        .foregroundStyle(upActive ? Color.accentColor : Color(nsColor: .tertiaryLabelColor))
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 6, weight: .bold))
-                        .foregroundStyle(downActive ? Color.accentColor : Color(nsColor: .tertiaryLabelColor))
-                }
-                Text(label)
-                    .foregroundStyle(active ? Color.primary : Color.secondary)
-            }
-            .font(.caption.weight(.semibold))
-            .frame(width: colW, alignment: .trailing)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(active
-              ? (sortAscending ? "按\(label)从小到大排序（点击切换为从大到小）" : "按\(label)从大到小排序（点击切换为从小到大）")
-              : "点击按\(label)排序")
-    }
-
-    private func sortedProjects(_ projs: [Snapshot.ProjectRow]) -> [Snapshot.ProjectRow] {
-        projs.sorted { a, b in
-            let va = sortColumn == .hour ? a.hour : a.total
-            let vb = sortColumn == .hour ? b.hour : b.total
-            return sortAscending ? va < vb : va > vb
-        }
-    }
-
-    private func sortedTasks(_ tasks: [Snapshot.MergedTask]) -> [Snapshot.MergedTask] {
-        tasks.sorted { a, b in
-            let va = sortColumn == .hour ? a.hour : a.total
-            let vb = sortColumn == .hour ? b.hour : b.total
-            return sortAscending ? va < vb : va > vb
-        }
-    }
-
-    private func projectRowView(_ proj: Snapshot.ProjectRow) -> some View {
-        let isExpanded = expandedProjects.contains(proj.id)
-        return HStack(spacing: 0) {
-            Button(action: { toggleExpand(proj.id) }) {
-                HStack(spacing: 6) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                        .foregroundStyle(.secondary)
-                        .frame(width: chevW)
-                    Circle().fill(proj.running ? Color.green : Color.clear)
-                        .frame(width: 6, height: 6)
-                        .overlay(Circle().stroke(proj.running ? Color.green : Color(nsColor: .separatorColor), lineWidth: 1))
-                    Text(proj.name)
-                        .font(.callout)
-                        .lineLimit(1)
-                        .foregroundStyle(.primary)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("\(proj.sessionCount) 个会话 · 今日 \(model.money(proj.today))")
-            Spacer(minLength: 8)
-            Text(model.money(proj.hour))
-                .font(.callout.monospacedDigit())
-                .frame(width: colW, alignment: .trailing)
-            Text(model.money(proj.total))
-                .font(.callout.weight(.semibold).monospacedDigit())
-                .foregroundStyle(.primary)
-                .frame(width: colW, alignment: .trailing)
-            Button(action: { model.openProject(proj.cwd) }) {
-                Image(systemName: "folder")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .frame(width: folderW)
-            }
-            .buttonStyle(.plain)
-            .padding(.leading, 6)
-            .help("在 Finder 中打开项目文件夹")
-        }
-        .padding(.vertical, 4)
-        .contentShape(Rectangle())
-    }
-
-    private func taskRowView(_ task: Snapshot.MergedTask) -> some View {
-        HStack(spacing: 0) {
-            Circle().fill(task.running ? Color.green : Color.clear)
-                .frame(width: 6, height: 6)
-                .overlay(Circle().stroke(task.running ? Color.green : Color.clear, lineWidth: 1))
-            Text(task.name)
-                .font(.caption)
-                .lineLimit(1)
-                .foregroundStyle(.secondary)
-                .padding(.leading, 6)
-            Spacer(minLength: 8)
-            Text(model.money(task.hour))
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .frame(width: colW, alignment: .trailing)
-            Text(model.money(task.total))
-                .font(.caption.weight(.medium).monospacedDigit())
-                .foregroundStyle(.secondary)
-                .frame(width: colW, alignment: .trailing)
-            Color.clear.frame(width: folderW + 6)
-        }
-        .padding(.vertical, 2)
-        .contentShape(Rectangle())
-        .help(taskHelp(task))
-    }
-
-    private func taskHelp(_ task: Snapshot.MergedTask) -> String {
-        let subs = task.subCount ?? 0
-        var parts = [subs > 0 ? "\(task.sessionCount) 个会话（含 \(subs) 个子代理）" : "\(task.sessionCount) 个会话"]
-        if let m = task.model { parts.append(m) }
-        parts.append("输入 \(model.compactTokens(task.tokens.input + task.tokens.cacheRead))")
-        parts.append("输出 \(model.compactTokens(task.tokens.output))")
-        parts.append("今日 \(model.money(task.today))")
-        return parts.joined(separator: " · ")
-    }
-
-    private func toggleExpand(_ id: String) {
-        if expandedProjects.contains(id) {
-            expandedProjects.remove(id)
-        } else {
-            expandedProjects.insert(id)
-        }
-    }
-
-    // MARK: WorkBuddy 总览（绑定的 DeepSeek 用量金额，只做总览不列明细）
-
-    private func workbuddySection(_ snap: Snapshot) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Divider().padding(.vertical, 2)
-            HStack {
-                HStack(spacing: 5) {
-                    Image(systemName: "briefcase.fill")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                    Text("WorkBuddy · DeepSeek 用量")
-                        .font(.caption.weight(.semibold))
-                        .foregroundColor(.secondary)
-                }
-                Spacer()
-                if let wb = snap.workbuddy, wb.lastEventAt != nil {
-                    Text("本地 trace 统计 · 单位 ¥")
-                        .font(.caption2)
-                        .foregroundColor(Color(nsColor: .tertiaryLabelColor))
-                }
-            }
-            if let wb = snap.workbuddy {
-                HStack(spacing: 18) {
-                    wbStatCell(label: "本小时", value: wb.hour)
-                    wbStatCell(label: "今日", value: wb.today)
-                    wbStatCell(label: "累计", value: wb.total)
-                    if let calls = wb.calls {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("调用").font(.caption2).foregroundColor(.secondary)
-                            Text("\(calls) 次")
-                                .font(.callout.weight(.semibold).monospacedDigit())
-                        }
-                    }
-                }
-            } else {
-                Text(snap.workbuddyError ?? "未检测到 WorkBuddy 的 DeepSeek 用量数据")
-                    .font(.caption)
-                    .foregroundColor(Color(nsColor: .tertiaryLabelColor))
-            }
-        }
-    }
-
-    private func wbStatCell(label: String, value: Double) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(label).font(.caption2).foregroundColor(.secondary)
+            Text(label)
+                .font(.system(size: 11))
+                .foregroundStyle(dim)
             Text(model.money(value))
-                .font(.callout.weight(.semibold).monospacedDigit())
+                .font(.system(size: 17, weight: .semibold, design: .rounded).monospacedDigit())
+                .foregroundStyle(.primary)
         }
+        .accessibilityElement(children: .combine)
     }
 
-    // MARK: 底部按钮
+    // MARK: 提示（余额取不到 / 未定价模型）
+
+    private func warningLine(_ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 4) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 9))
+                .foregroundStyle(.orange)
+            Text(text)
+                .font(.system(size: 10))
+                .foregroundStyle(dim)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .help(model.warning ?? (model.snapshot?.errors ?? []).joined(separator: "\n"))
+    }
+
+    // MARK: 底部
 
     private var footer: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 10) {
             Button(action: { model.forceRefresh() }) {
                 Label("刷新", systemImage: "arrow.clockwise")
+                    .padding(.vertical, 3)
+                    .contentShape(Rectangle())
             }
-            Button(action: { model.openHarness() }) {
-                Label("打开 Harness", systemImage: "globe")
-            }
-            Spacer()
+            Spacer(minLength: 8)
             Toggle("开机自启", isOn: Binding(
                 get: { model.launchAtLogin },
                 set: { _ in model.toggleLaunchAtLogin() }
             ))
             .toggleStyle(.switch)
             .controlSize(.mini)
-            .help("开启后，登录 Mac 时自动启动本应用")
+            .help("登录 Mac 时自动启动本应用")
             Button(role: .destructive, action: { NSApp.terminate(nil) }) {
                 Label("退出", systemImage: "power")
+                    .padding(.vertical, 3)
+                    .contentShape(Rectangle())
             }
         }
-        .font(.caption)
+        .font(.system(size: 11))
         .buttonStyle(.borderless)
         .labelStyle(.titleAndIcon)
     }
@@ -825,7 +422,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let model = SpendingModel()
     private var statusItem: NSStatusItem?
     private let popover = NSPopover()
-    private var demoWindow: NSWindowController?
+    private var panelWindow: NSWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -839,38 +436,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         popover.behavior = .transient
         popover.delegate = self
-        popover.contentViewController = NSHostingController(
+        if let forced = NSApp.appearance { popover.appearance = forced } // 跟随 --appearance 调试开关
+        let host = NSHostingController(
             rootView: MenuView(model: model).environment(\.font, .system(size: 12))
         )
-        popover.contentSize = NSSize(width: 376, height: 560)
+        host.sizingOptions = [.preferredContentSize]
+        popover.contentViewController = host
+        popover.contentSize = NSSize(width: 300, height: 250)
 
-        model.updateStatusTitle()
         model.start()
         if CommandLine.arguments.contains("--show-window") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-                self?.showDemoWindow()
+                self?.showPanelWindow()
             }
         }
     }
 
-    private func showDemoWindow() {
+    /// 供截图 / 调试：把同一个面板放进普通窗口
+    private func showPanelWindow() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 376, height: 560),
-            styleMask: [.titled, .closable, .miniaturizable],
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 250),
+            styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
         )
-        window.title = "DeepSeek 消费"
+        window.title = "DeepSeek 余额"
         window.level = .floating
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        window.contentViewController = NSHostingController(
+        let host = NSHostingController(
             rootView: MenuView(model: model)
                 .environment(\.font, .system(size: 12))
-                .frame(width: 376, height: 560)
+                .frame(width: 300)
         )
+        window.contentViewController = host
         window.center()
         let controller = NSWindowController(window: window)
-        demoWindow = controller
+        panelWindow = controller
         controller.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -889,13 +490,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         model.quitting = true
-        // 采集器子进程会在父进程退出后自行结束
+        // 采集器子进程会随父进程退出自行结束
     }
 }
 
 // MARK: - 入口
 
 let app = NSApplication.shared
+// 调试用：--appearance light|dark 强制外观，便于截图核对明暗两套配色
+if let i = CommandLine.arguments.firstIndex(of: "--appearance"), i + 1 < CommandLine.arguments.count {
+    let light = CommandLine.arguments[i + 1] == "light"
+    app.appearance = NSAppearance(named: light ? .aqua : .darkAqua)
+}
 let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(CommandLine.arguments.contains("--show-window") ? .regular : .accessory)

@@ -8,3 +8,9 @@ dist/
 
 # macOS
 .DS_Store
+
+# 本地构建用的自包含 Node 运行时（约 120MB 二进制，不入库）
+tools/node-runtime
+
+# 1.1.0 时期的本地备份
+.backup-1.1.0/

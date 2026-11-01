@@ -5,111 +5,118 @@
 # DeepSeekSpend
 
 <p align="center">
-  <img src="assets/product-overview-zh.png" alt="DeepSeekSpend 功能概览" width="100%">
+  <img src="assets/panel-dark.png" alt="DeepSeekSpend 面板" width="320">
 </p>
 
 <p align="center">
-  一个放在 macOS 菜单栏里的本地消费面板：查看 DeepSeek Harness 每个自然小时、项目和任务的用量估算。
+  一个只回答两个问题的 macOS 菜单栏小组件：<b>我还剩多少钱</b>、<b>我这一小时花了多少</b>。
 </p>
 
 <p align="center">
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-16A34A?style=flat-square"></a>
   <img alt="macOS 13+" src="https://img.shields.io/badge/macOS-13%2B-1E3A8A?style=flat-square&logo=apple&logoColor=white">
   <img alt="Apple silicon" src="https://img.shields.io/badge/Apple%20silicon-arm64-2563EB?style=flat-square">
-  <a href="https://github.com/yinshi1226-ai/DeepSeekSpend/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/yinshi1226-ai/DeepSeekSpend/ci.yml?label=CI&style=flat-square"></a>
-  <a href="https://github.com/yinshi1226-ai/DeepSeekSpend/releases"><img alt="Release" src="https://img.shields.io/github/v/release/yinshi1226-ai/DeepSeekSpend?label=release&style=flat-square"></a>
 </p>
 
 > [!IMPORTANT]
-> 面板金额由本地 token 记录和价格表计算，是便于观察趋势的估算值，不是 DeepSeek 官方账单。充值、余额和最终扣费请以官方平台为准。
-
-## 你能看到什么
-
-- 菜单栏常驻显示当前自然小时的消费估算：`● ¥X.XX`。
-- 弹窗汇总本小时、今日和历史累计金额。
-- 近 24 个自然小时柱状图，点击柱子可查看对应小时。
-- 项目列表同时显示实时与累计金额，展开后可看到任务、模型及 token 构成。
-- 顶层任务自动合并其子代理消费，空白会话不进入列表。
-- 单独汇总 WorkBuddy 的 DeepSeek 用量和调用次数。
-- 可选显示 DeepSeek 账户余额；点击后跳转官方平台。
+> 花费是按本地 token 记录和价目表算出来的**估算值**，不是 DeepSeek 官方账单。余额来自官方接口；最终扣费以官方平台为准。
 
 ## 界面
 
-<p align="center">
-  <img src="assets/app-demo.png" alt="DeepSeekSpend 匿名演示界面" width="520">
-</p>
+| 深色 | 浅色 |
+|---|---|
+| <img src="assets/panel-dark.png" width="280"> | <img src="assets/panel-light.png" width="280"> |
 
-截图由内置 `--demo` 模式生成。项目名、金额、余额和调用次数均为演示数据，不包含个人记录。
+- 状态栏常驻显示余额：`¥37.02`。
+- 大字是剩余额度，小字是本自然小时的消费。
+- 下面一行是今日花费与累计花费。
+- 底部只有刷新、开机自启、退出。没有项目树、没有会话明细、没有柱状图。
 
-## 计价口径
+> 截图中的余额与花费为演示数据，通过 `--appearance` 强制外观后截取。
+
+## 它是怎么算的
 
 ```text
-消费估算 = 未命中缓存的输入 token × 输入价
-         + 命中缓存的输入 token × 缓存价
-         + 输出 token × 输出价
+花费 = 未命中缓存的输入 token × 输入价
+     + 命中缓存的输入 token × 缓存价
+     + 输出 token × 输出价
 ```
 
-默认价格表依据 [DeepSeek 官方定价页](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/) 中的 `deepseek-v4-pro` 与 `deepseek-v4-flash` 人民币价格维护。未知模型不会被悄悄套用其他模型价格，而是计为 0 并在快照错误中提示。
+- **按官方价目计费**：价目表取自 [DeepSeek 官方定价页](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)，并区分时段——北京时间工作日 09:00-12:00、14:00-18:00 为高峰，其余为空闲（半价）。
+- **本地模型免费**：写进 `freeModels` 的模型按 ¥0 计，例如本地部署的 `GLM-5.3-Flash`，不会产生「缺价」告警。
+- **跨会话去重**：DSH 的分支 / 子代理会话会把父会话历史整段复制进自己的日志，采集器按「时间 + 模型 + token」指纹去重，同一笔调用只算一次。
+- 未配置单价的模型不会被悄悄套用别的价格，而是计 ¥0 并在面板上提示。
 
 ## 安装
 
-### 下载 Release（推荐）
-
-1. 打开 [最新 Release](https://github.com/yinshi1226-ai/DeepSeekSpend/releases/latest)，下载 `DeepSeekSpend-v*-macOS-arm64.zip`。
-2. 解压，把 `DeepSeekSpend.app` 拖到“应用程序”，也可以放在其他固定位置。
-3. 首次启动时右键 App →“打开”，确认运行本地签名应用。
-4. 如有需要，在弹窗底部开启“开机自启”。
-
-Release 已内置兼容的 Node.js 运行时，使用者无需另外安装。当前支持 Apple silicon Mac 和 macOS 13 及以上版本。
-
-### 源码构建
+目前没有预编译的 Release，从源码构建：
 
 ```bash
-git clone https://github.com/yinshi1226-ai/DeepSeekSpend.git
+git clone <你的仓库地址> DeepSeekSpend
 cd DeepSeekSpend
-npm test
-./build.sh release
-open ../DeepSeekSpend.app
+npm test          # 采集与计价单元测试
+./build.sh        # 产物：../build/DeepSeekSpend.app
+open ../build/DeepSeekSpend.app
 ```
 
-源码构建需要 Swift 工具链和 Node.js 22.15 及以上版本。
+要求：Apple silicon Mac、macOS 13+、Swift 工具链、Node.js 22.15+（支持 zstd）。
+
+`build.sh` 需要一个**自包含**的 Node 可执行文件，默认依次找：
+
+1. `tools/node-runtime`
+2. `/Applications/DeepSeekSpend.app/Contents/Resources/node`
+3. `$PATH` 里的 `node`
+
+也可以用 `DEEPSEEKSPEND_NODE=/path/to/node ./build.sh` 指定。Homebrew 的 `node` 是动态链接 `libnode.dylib` 的精简版，直接塞进 App 会启动失败，脚本会自动跳过它。
 
 ## 数据与隐私
 
-| 数据 | 本地来源或网络边界 |
+| 数据 | 来源 |
 |---|---|
-| Harness 任务与 token | `~/Documents/DeepSeek-Harness/data/sessions/**/session.jsonl.zstd` 与本机 Harness API |
-| 项目运行状态 | `http://127.0.0.1:3080/api/session.list` |
-| WorkBuddy 用量 | `~/.workbuddy/traces/**/*.json` |
-| 账户余额（可选） | API Key 仅用于请求 DeepSeek 官方 `https://api.deepseek.com/user/balance` |
+| 模型调用与 token | `~/.dsh/sessions/**/session.v4.jsonl.zstd`（兼容 `session.jsonl.zstd` / `session.jsonl`） |
+| API Key | `~/.dsh/.credentials.yaml` 里的 `DEEPSEEK_API_KEY` |
+| 账户余额 | `https://api.deepseek.com/user/balance` |
 
-- 任务解析和金额计算在本机完成。
-- 项目名和任务明细不会被发送到第三方服务器。
-- 本项目不包含遥测或广告 SDK。
-- 余额查询会把 Harness 已配置的 API Key 发送给 DeepSeek 官方接口；如果未配置，其他本地统计仍可使用。
-- 应用包采用 ad-hoc 签名，没有创建或安装自签名根证书。
-
-更多边界与漏洞报告方式见 [SECURITY.md](SECURITY.md)。
+- 会话日志在本机解析，聊天内容不会被读取上传，只统计 token 数量。
+- 唯一的网络请求是余额查询，Key 只发给 DeepSeek 官方接口。
+- 没有遥测、没有广告 SDK、没有第三方服务器。
+- 应用包用 ad-hoc 签名，构建过程不创建证书、不改钥匙串、不动系统信任设置。
 
 ## 配置
 
-运行期配置位于 `~/Library/Application Support/DeepSeekSpend/config.json`：
+运行期配置在 `~/Library/Application Support/DeepSeekSpend/config.json`：
 
-- `prices`：价格表（元 / 百万 tokens）；
-- `apiBase`：DeepSeek Harness 本地地址；
-- `pollIntervalMs` / `balanceIntervalMs`：采集与余额刷新间隔；
-- `workbuddyTracesDir`：WorkBuddy trace 目录。
+| 字段 | 说明 |
+|---|---|
+| `dshDataDir` | DSH 数据目录，默认 `~/.dsh` |
+| `prices.peakIdle` / `prices.flat` | 价目表（元 / 百万 tokens） |
+| `freeModels` | 免费模型名单，支持 `glm-*` 通配 |
+| `pollIntervalMs` / `balanceIntervalMs` | 采集间隔（默认 8s）/ 余额刷新间隔（默认 5min） |
+| `platformUrl` | 点「账单」时打开的地址 |
 
-升级时会保留你的路径和轮询设置，同时更新应用内已核对的官方价格表。
+App 启动时会把包内 `config.json` 的 `prices`、`freeModels` 同步进用户配置，其余字段保留你的改动。
 
-## 开发与验证
+## 开发
 
 ```bash
-npm test               # 采集与计价测试
-./build.sh              # 本地构建
-./build.sh release      # 构建 App 和分发 zip
+npm test            # 8 个用例：峰谷时段、两档价目、免费模型、去重、事件解析
+./build.sh          # 构建到 ../build/
+open ../build/DeepSeekSpend.app
 ```
+
+调试用：`--appearance light|dark` 强制外观，`--show-window` 把面板放进普通窗口（便于截图）。
+
+## 与上游的关系
+
+这是 [yinshi1226-ai/DeepSeekSpend](https://github.com/yinshi1226-ai/DeepSeekSpend) 的本地改版，保留上游的 MIT 许可与版权声明。
+
+主要改动：
+
+- 界面从「项目 / 任务 / 24 小时图表 / WorkBuddy」精简为「余额 + 花费」。
+- 采集器不再调用本地 Harness API，只读会话日志；新增跨会话去重与本地免费模型支持。
+- 计价改为官方高峰 / 空闲两档。
+- 构建脚本适配新版 Harness 的日志命名、CLT 的 SwiftBridging modulemap 冲突、以及自包含 Node 运行时。
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) © 上游作者与本仓库贡献者
